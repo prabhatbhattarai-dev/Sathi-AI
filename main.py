@@ -25,14 +25,15 @@ logger.info(f"API key loaded: {'YES' if API_KEY else 'NO'}")
 
 client = genai.Client(api_key=API_KEY)
 
-# Primary model + fallbacks (tried in order if one is busy or retired)
-MODEL = "gemini-2.5-flash"
-FALLBACK_MODELS = [
+# Models tried in order. If one fails with 503/404, next one is tried.
+MODELS = [
+    "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
     "gemini-2.5-pro",
     "gemini-flash-latest",
     "gemini-3.8-flash",
     "gemini-3.6-flash",
+    "gemini-3.5-flash",
 ]
 
 app = FastAPI(title="Sathi AI")
@@ -53,17 +54,6 @@ class ChatRequest(BaseModel):
     message: str
 
 
-def try_stream(model_name, history):
-    """Generator that yields text chunks. Raises on failure."""
-    response = client.models.generate_content_stream(
-        model=model_name,
-        contents=history,
-    )
-    for chunk in response:
-        if chunk.text:
-            yield chunk.text
-
-
 @app.post("/chat")
 async def chat(req: ChatRequest):
     session_id = req.session_id or str(uuid.uuid4())
@@ -78,40 +68,51 @@ async def chat(req: ChatRequest):
     def stream():
         full_reply = ""
         last_error = None
-        models_to_try = [MODEL] + FALLBACK_MODELS
 
-        for model_name in models_to_try:
-            # Retry same model up to 2 times on transient errors
-            for attempt in range(2):
+        for model_name in MODELS:
+            # Try each model up to 3 times with increasing waits
+            for attempt in range(3):
                 try:
-                    logger.info(f"[{session_id}] Trying model={model_name} attempt={attempt+1}")
+                    logger.info(f"[{session_id}] Trying {model_name} (attempt {attempt+1})")
                     got_any = False
-                    for chunk in try_stream(model_name, history):
-                        got_any = True
-                        full_reply += chunk
-                        yield chunk
+
+                    response = client.models.generate_content_stream(
+                        model=model_name,
+                        contents=history,
+                    )
+                    for chunk in response:
+                        if chunk.text:
+                            got_any = True
+                            full_reply += chunk.text
+                            yield chunk.text
+
                     if got_any:
-                        logger.info(f"[{session_id}] Model {model_name} succeeded")
+                        logger.info(f"[{session_id}] ✅ Success with {model_name}")
                         history.append(
                             types.Content(role="model", parts=[types.Part(text=full_reply)])
                         )
                         return
+
                 except Exception as e:
                     last_error = e
                     err = str(e)
                     logger.warning(f"[{session_id}] {model_name} attempt {attempt+1} failed: {err[:150]}")
-                    is_transient = any(k in err for k in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "overloaded", "high demand"])
+
                     is_retired = any(k in err for k in ["404", "NOT_FOUND", "no longer available"])
+                    is_busy = any(k in err for k in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "high demand", "overloaded"])
+
                     if is_retired:
-                        break
-                    if is_transient and attempt == 0:
-                        time.sleep(2)
+                        break  # move to next model immediately
+                    if is_busy and attempt < 2:
+                        wait = 3 * (attempt + 1)  # 3s, 6s
+                        logger.info(f"[{session_id}] Waiting {wait}s before retry...")
+                        time.sleep(wait)
                         continue
-                    break
+                    break  # move to next model
 
         err_msg = str(last_error) if last_error else "All models busy"
-        logger.error(f"[{session_id}] All attempts failed. Last: {err_msg[:200]}")
-        yield f"\n\n⚠️ AI is temporarily busy. Please try again in a few seconds.\n\n(Details: {err_msg[:180]})"
+        logger.error(f"[{session_id}] All failed: {err_msg[:200]}")
+        yield f"\n\n⚠️ Sathi is a bit overloaded right now. Please try again in a few seconds.\n\n_(Technical: {err_msg[:150]})_"
 
     return StreamingResponse(
         stream(),
