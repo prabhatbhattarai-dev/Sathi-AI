@@ -1,6 +1,7 @@
 import os
 import uuid
 import logging
+import time
 from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -11,7 +12,6 @@ from pydantic import BaseModel
 from google import genai
 from google.genai import types
 
-# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sathi")
 
@@ -23,34 +23,16 @@ STATIC_DIR = BASE_DIR / "static"
 API_KEY = os.getenv("GEMINI_API_KEY")
 logger.info(f"API key loaded: {'YES' if API_KEY else 'NO'}")
 
-# Configure the client with robust retry logic
-# This handles 503 errors automatically with exponential backoff
-retry_config = types.HttpRetryOptions(
-    attempts=5,          # Try up to 5 times
-    initial_delay=1.0,   # Start with 1 second
-    max_delay=16.0,      # Max wait of 16 seconds
-    exp_base=2.0,        # Exponential multiplier (1s, 2s, 4s, 8s, 16s)
-    jitter=1.0,          # Add randomness to avoid thundering herd
-)
+client = genai.Client(api_key=API_KEY)
 
-client = genai.Client(
-    api_key=API_KEY,
-    http_options=types.HttpOptions(
-        api_version="v1",  # Use the stable v1 endpoint
-        retry_options=retry_config
-    )
-)
-
-# ✅ Primary model: Google's stable alias
-MODEL = "gemini-flash-latest"
-
-# ✅ Fallback models: tried in order if the primary model returns 503 or 404
-# Updated based on current model availability (2026)
+# Primary model + fallbacks (tried in order if one is busy or retired)
+MODEL = "gemini-2.5-flash"
 FALLBACK_MODELS = [
-    "gemini-3.5-flash",
-    "gemini-3.6-flash",
-    "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
+    "gemini-2.5-pro",
+    "gemini-flash-latest",
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
 ]
 
 app = FastAPI(title="Sathi AI")
@@ -65,9 +47,22 @@ app.add_middleware(
 
 sessions = {}
 
+
 class ChatRequest(BaseModel):
     session_id: str | None = None
     message: str
+
+
+def try_stream(model_name, history):
+    """Generator that yields text chunks. Raises on failure."""
+    response = client.models.generate_content_stream(
+        model=model_name,
+        contents=history,
+    )
+    for chunk in response:
+        if chunk.text:
+            yield chunk.text
+
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
@@ -78,54 +73,45 @@ async def chat(req: ChatRequest):
         sessions[session_id] = []
 
     history = sessions[session_id]
-    history.append(
-        types.Content(role="user", parts=[types.Part(text=req.message)])
-    )
+    history.append(types.Content(role="user", parts=[types.Part(text=req.message)]))
 
     def stream():
         full_reply = ""
         last_error = None
-
-        # Try the primary model, then each fallback
         models_to_try = [MODEL] + FALLBACK_MODELS
 
         for model_name in models_to_try:
-            try:
-                logger.info(f"[{session_id}] Trying model: {model_name}")
-
-                response = client.models.generate_content_stream(
-                    model=model_name,
-                    contents=history,
-                )
-
-                for chunk in response:
-                    if chunk.text:
-                        full_reply += chunk.text
-                        yield chunk.text
-
-                logger.info(f"[{session_id}] Model {model_name} succeeded")
-                break
-
-            except Exception as e:
-                last_error = e
-                error_str = str(e)
-                logger.warning(f"[{session_id}] Model {model_name} failed: {error_str[:120]}")
-
-                # If the model is unavailable (503) or not found (404), try the next one
-                if "503" in error_str or "UNAVAILABLE" in error_str or "404" in error_str or "NOT_FOUND" in error_str:
-                    continue
-                else:
+            # Retry same model up to 2 times on transient errors
+            for attempt in range(2):
+                try:
+                    logger.info(f"[{session_id}] Trying model={model_name} attempt={attempt+1}")
+                    got_any = False
+                    for chunk in try_stream(model_name, history):
+                        got_any = True
+                        full_reply += chunk
+                        yield chunk
+                    if got_any:
+                        logger.info(f"[{session_id}] Model {model_name} succeeded")
+                        history.append(
+                            types.Content(role="model", parts=[types.Part(text=full_reply)])
+                        )
+                        return
+                except Exception as e:
+                    last_error = e
+                    err = str(e)
+                    logger.warning(f"[{session_id}] {model_name} attempt {attempt+1} failed: {err[:150]}")
+                    is_transient = any(k in err for k in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "overloaded", "high demand"])
+                    is_retired = any(k in err for k in ["404", "NOT_FOUND", "no longer available"])
+                    if is_retired:
+                        break
+                    if is_transient and attempt == 0:
+                        time.sleep(2)
+                        continue
                     break
 
-        if full_reply:
-            history.append(
-                types.Content(role="model", parts=[types.Part(text=full_reply)])
-            )
-            logger.info(f"[{session_id}] Replied: {len(full_reply)} chars")
-        else:
-            error_msg = str(last_error) if last_error else "All models unavailable"
-            logger.error(f"[{session_id}] All models failed. Last error: {error_msg}")
-            yield f"\n\n⚠️ All AI models are currently busy. Please try again in a moment.\n\n(Details: {error_msg[:200]})"
+        err_msg = str(last_error) if last_error else "All models busy"
+        logger.error(f"[{session_id}] All attempts failed. Last: {err_msg[:200]}")
+        yield f"\n\n⚠️ AI is temporarily busy. Please try again in a few seconds.\n\n(Details: {err_msg[:180]})"
 
     return StreamingResponse(
         stream(),
@@ -133,8 +119,10 @@ async def chat(req: ChatRequest):
         headers={"X-Session-Id": session_id},
     )
 
+
 @app.get("/")
 async def serve_index():
     return FileResponse(STATIC_DIR / "index.html")
+
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
