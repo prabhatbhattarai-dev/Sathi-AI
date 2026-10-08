@@ -24,7 +24,9 @@ API_KEY = os.getenv("GEMINI_API_KEY")
 logger.info(f"API key loaded: {'YES' if API_KEY else 'NO'} (length: {len(API_KEY) if API_KEY else 0})")
 
 client = genai.Client(api_key=API_KEY)
-MODEL = "gemini-2.0-flash"
+
+# ✅ FIXED: Google retired gemini-2.0-flash. Use the current model.
+MODEL = "gemini-3.8-flash"
 
 app = FastAPI(title="Sathi AI")
 
