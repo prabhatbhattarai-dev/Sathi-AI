@@ -25,8 +25,15 @@ logger.info(f"API key loaded: {'YES' if API_KEY else 'NO'} (length: {len(API_KEY
 
 client = genai.Client(api_key=API_KEY)
 
-# ✅ FIXED: Google retired gemini-2.0-flash. Use the current model.
-MODEL = "gemini-3.8-flash"
+# ✅ Primary model: Google's stable alias that always points to the latest Flash model
+MODEL = "gemini-flash-latest"
+
+# ✅ Fallback models: tried in order if the primary model returns 503 or 404
+FALLBACK_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-3.8-flash",
+]
 
 app = FastAPI(title="Sathi AI")
 
@@ -64,25 +71,52 @@ async def chat(req: ChatRequest):
 
     def stream():
         full_reply = ""
-        try:
-            response = client.models.generate_content_stream(
-                model=MODEL,
-                contents=history,
-            )
-            for chunk in response:
-                if chunk.text:
-                    full_reply += chunk.text
-                    yield chunk.text
+        last_error = None
 
+        # Try the primary model, then each fallback
+        models_to_try = [MODEL] + FALLBACK_MODELS
+
+        for model_name in models_to_try:
+            try:
+                logger.info(f"[{session_id}] Trying model: {model_name}")
+
+                response = client.models.generate_content_stream(
+                    model=model_name,
+                    contents=history,
+                )
+
+                for chunk in response:
+                    if chunk.text:
+                        full_reply += chunk.text
+                        yield chunk.text
+
+                # If we got here, the model worked
+                logger.info(f"[{session_id}] Model {model_name} succeeded")
+                break
+
+            except Exception as e:
+                last_error = e
+                error_str = str(e)
+                logger.warning(f"[{session_id}] Model {model_name} failed: {error_str[:120]}")
+
+                # If the model is unavailable (503) or not found (404), try the next one
+                if "503" in error_str or "UNAVAILABLE" in error_str or "404" in error_str or "NOT_FOUND" in error_str:
+                    continue
+                else:
+                    # Some other error (bad API key, etc.) — don't retry
+                    break
+
+        if full_reply:
             # Save assistant reply to history
             history.append(
                 types.Content(role="model", parts=[types.Part(text=full_reply)])
             )
             logger.info(f"[{session_id}] Replied: {len(full_reply)} chars")
-
-        except Exception as e:
-            logger.exception(f"[{session_id}] Gemini error: {e}")
-            yield f"\n\n⚠️ Error: {str(e)}"
+        else:
+            # All models failed
+            error_msg = str(last_error) if last_error else "All models unavailable"
+            logger.error(f"[{session_id}] All models failed. Last error: {error_msg}")
+            yield f"\n\n⚠️ All AI models are currently busy. Please try again in a moment.\n\n(Details: {error_msg[:200]})"
 
     return StreamingResponse(
         stream(),
