@@ -1,5 +1,6 @@
 import os
 import uuid
+import logging
 from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -8,21 +9,25 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from google import genai
+from google.genai import types
+
+# Setup logging so we can see errors in Render logs
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("sathi")
 
 load_dotenv()
 
-# Absolute paths — prevents "file not found" errors when deployed
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
-# Initialize Gemini client
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-MODEL = "gemini-2.5-flash"
+API_KEY = os.getenv("GEMINI_API_KEY")
+logger.info(f"API key loaded: {'YES' if API_KEY else 'NO'} (length: {len(API_KEY) if API_KEY else 0})")
 
-# Create FastAPI app
+client = genai.Client(api_key=API_KEY)
+MODEL = "gemini-2.0-flash"
+
 app = FastAPI(title="Sathi AI")
 
-# Allow the frontend (Vercel) to talk to this backend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,7 +36,6 @@ app.add_middleware(
     expose_headers=["X-Session-Id"],
 )
 
-# In-memory chat sessions (resets when server restarts — fine for MVP)
 sessions = {}
 
 
@@ -43,16 +47,40 @@ class ChatRequest(BaseModel):
 @app.post("/chat")
 async def chat(req: ChatRequest):
     session_id = req.session_id or str(uuid.uuid4())
+    logger.info(f"[{session_id}] User: {req.message[:80]}")
 
+    # Get or create history for this session
     if session_id not in sessions:
-        sessions[session_id] = client.chats.create(model=MODEL)
+        sessions[session_id] = []
 
-    chat_session = sessions[session_id]
+    history = sessions[session_id]
+
+    # Append user message
+    history.append(
+        types.Content(role="user", parts=[types.Part(text=req.message)])
+    )
 
     def stream():
-        for chunk in chat_session.send_message_stream(req.message):
-            if chunk.text:
-                yield chunk.text
+        full_reply = ""
+        try:
+            response = client.models.generate_content_stream(
+                model=MODEL,
+                contents=history,
+            )
+            for chunk in response:
+                if chunk.text:
+                    full_reply += chunk.text
+                    yield chunk.text
+
+            # Save assistant reply to history
+            history.append(
+                types.Content(role="model", parts=[types.Part(text=full_reply)])
+            )
+            logger.info(f"[{session_id}] Replied: {len(full_reply)} chars")
+
+        except Exception as e:
+            logger.exception(f"[{session_id}] Gemini error: {e}")
+            yield f"\n\n⚠️ Error: {str(e)}"
 
     return StreamingResponse(
         stream(),
@@ -66,5 +94,4 @@ async def serve_index():
     return FileResponse(STATIC_DIR / "index.html")
 
 
-# Serve any other static assets
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
