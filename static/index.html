@@ -289,7 +289,6 @@
 </main>
 
 <script>
-// Relative path — works because main.py serves index.html from the same origin
 const BACKEND_URL = "";
 
 const inner = document.getElementById("inner");
@@ -448,14 +447,18 @@ input.addEventListener("input", () => {
   input.style.height = "auto";
   input.style.height = Math.min(input.scrollHeight, 200) + "px";
 });
+
+// ✅ FIXED: Start a new chat WITHOUT clearing the history sidebar
 newChatBtn.addEventListener("click", () => {
   sessionId = null;
   inner.innerHTML = "";
-  historyEl.innerHTML = "";
   topbarTitle.textContent = "New conversation";
+  // Remove "active" highlight from history items (but keep them!)
+  document.querySelectorAll(".history-item").forEach(h => h.classList.remove("active"));
   showWelcome();
   input.focus();
 });
+
 menuBtn.addEventListener("click", () => {
   sidebar.classList.toggle("open");
 });
